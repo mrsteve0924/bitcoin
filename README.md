@@ -6,12 +6,12 @@ some bitcoin-cli commands put together to get useful information from bitcoin se
 
 requires jq to parse json files
 
-bitcoin-dashboard output
+`bitcoin-dashboard` output
   - The wallet balance in BTC and $US will be displayed if wallet is enabled
     
 ![bitcoin](https://github.com/user-attachments/assets/8d4be032-8c96-4302-aa64-bf49bf65163f)
 
 
-address: shows used and new addresses.  help prevent reusing old addresses
+`address`: shows used and new addresses.  help prevent reusing old addresses
 
-bitcoin-down: sends email and sms notification if bitcoin core crashes
+`bitcoin-down`: sends email and sms notification if bitcoin core crashes
