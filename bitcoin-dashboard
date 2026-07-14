@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# chatgpt optimized
+# using a cache for curl commands to not overload APIs
+clear
+set -Eeuo pipefail
+source ~/Rxs/colors
+
+BTC_VALUE_FILE="$HOME/.bitcoin/BTC_value"
+NODE_DOWN_LOG="$HOME/.bitcoin/node_down_log"
+
+CACHE_DIR="$HOME/.cache/btc-script"
+COINGECKO_CACHE="$CACHE_DIR/coingecko-price.json"
+FEES_CACHE="$CACHE_DIR/mempool-fees.json"
+
+COINGECKO_TTL=60   # seconds
+FEES_TTL=60        # seconds
+
+mkdir -p "$CACHE_DIR"
+
+BITCOIN_DATADIR="/mnt/files.ntfs/Crypto/Bitcoin"
+BITCOIN_CONF="bitcoin-pruned.conf"
+
+function bitcoin-cli {
+  command bitcoin-cli -datadir="$BITCOIN_DATADIR" -conf="$BITCOIN_CONF" "$@"
+}
+
+#check that certain commands exist on system
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }; }
+for c in bitcoin-cli jq curl bc awk date df free bitcoind; do require_cmd "$c"; done
+
+#format
+fmt_int() { LC_NUMERIC=en_US.UTF-8 printf "%'d" "$1" 2>/dev/null || echo "$1"; }
+fmt_usd0() { printf "%'.0f" "$1" 2>/dev/null || echo "$1"; }
+
+curl_cache() {
+  local url="$1"
+  local cache_file="$2"
+  local ttl="$3"
+
+  local now mtime age
+  now=$(date +%s)
+
+  # If cache exists and is fresh, use it
+  if [[ -r "$cache_file" ]]; then
+    mtime=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+    age=$((now - mtime))
+    if (( age < ttl )); then
+      cat "$cache_file"
+      return 0
+    fi
+  fi
+
+  # Otherwise refresh cache; if fetch fails, fall back to old cache if available
+  if curl -s -G "$url" > "$cache_file.tmp"; then
+    mv -f "$cache_file.tmp" "$cache_file"
+    cat "$cache_file"
+    return 0
+  fi
+
+  rm -f "$cache_file.tmp" 2>/dev/null || true
+
+  # fallback
+  if [[ -r "$cache_file" ]]; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  return 1
+}
+
+# ---- Load previous BTC0 (stored) ----
+BTC0_prev=0
+if [[ -r "$BTC_VALUE_FILE" ]]; then
+  # file contains: BTC0=<value>
+  # shellcheck disable=SC1090
+  source "$BTC_VALUE_FILE" || true
+  BTC0_prev="${BTC0:-0}"
+fi
+
+# ---- Bitcoin RPC (fetch ONCE where possible) ----
+nettotals_json=$(bitcoin-cli getnettotals)
+networkinfo_json=$(bitcoin-cli getnetworkinfo)
+mempoolinfo_json=$(bitcoin-cli getmempoolinfo)
+
+BTC0=$(bitcoin-cli getbalance)
+seconds=$(bitcoin-cli uptime)
+block0=$(bitcoin-cli getblockcount)
+
+# ---- Network ----
+totalbytesrecv=$(jq -r '.totalbytesrecv' <<<"$nettotals_json")
+totalbytessent=$(jq -r '.totalbytessent' <<<"$nettotals_json")
+
+bytes_rcv=$(echo "scale=4; $totalbytesrecv/1000000000" | bc)
+bytes_snt=$(echo "scale=4; $totalbytessent/1000000000" | bc)
+
+peers=$(jq -r '.connections' <<<"$networkinfo_json")
+outbound=$(jq -r '.connections_out' <<<"$networkinfo_json")
+inbound=$(jq -r '.connections_in' <<<"$networkinfo_json")
+
+# ---- Wallet diff (numeric) ----
+wallet=0
+BTC_diff=$(echo "scale=8; $BTC0 - $BTC0_prev" | bc)
+if awk "BEGIN{exit !($BTC0 > $BTC0_prev)}"; then
+  wallet=1
+fi
+
+# ---- BTC/USD price ----
+coingecko_json=$(curl_cache \
+  "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd" \
+  "$COINGECKO_CACHE" \
+  "$COINGECKO_TTL"
+)
+
+BTC2=$(jq -r '.bitcoin.usd' <<<"$coingecko_json")   # numeric price
+BTC1=$(fmt_usd0 "$BTC2")                            # formatted price: 92,746
+
+BTC_US=$(echo "scale=2; ($BTC0*$BTC2)/1" | bc | cut -d. -f1)
+BTC_US=$(fmt_int "$BTC_US")
+
+# ---- Fees  ----
+fees_json=$(curl_cache \
+  "https://mempool.space/api/v1/fees/recommended" \
+  "$FEES_CACHE" \
+  "$FEES_TTL"
+)
+feerate=$(jq -r '.hourFee' <<<"$fees_json")  # sats/vB
+
+miner_fee_US=$(echo "scale=2; ($feerate*144*.00000001*$BTC2)/1" | bc)
+miner_fee_BTC=$(echo "$feerate*144*.00000001" | bc)
+
+# ---- alt fee (one RPC) ----
+altfee_json=$(bitcoin-cli estimatesmartfee 6 economical)
+altfeerate=$(jq -r '.feerate // 0' <<<"$altfee_json")
+altfeerate_sats=$(echo "scale=10 ; $altfeerate/1000/.00000001" | bc | awk '{printf "%.0f\n", $1}')
+
+# ---- Blockchain (FAST MODE: getblockheader not getblock) ----
+block1=$((block0 - 1))
+block2=$((block0 - 2))
+
+block0_fmt=$(fmt_int "$block0")
+block1_fmt=$(fmt_int "$block1")
+block2_fmt=$(fmt_int "$block2")
+
+now=$(date +%s)
+
+block0_time=$(bitcoin-cli getblockheader "$(bitcoin-cli getblockhash "$block0")" | jq -r .time)
+block1_time=$(bitcoin-cli getblockheader "$(bitcoin-cli getblockhash "$block1")" | jq -r .time)
+block2_time=$(bitcoin-cli getblockheader "$(bitcoin-cli getblockhash "$block2")" | jq -r .time)
+
+block0_age=$(( (now - block0_time) / 60 ))
+block1_age=$(( (now - block1_time) / 60 ))
+block2_age=$(( (now - block2_time) / 60 ))
+
+# genesis
+block__time=1231006505
+block__age=$(( now - block__time ))
+genesis_block2=$(printf '%dyr:%dmo:%dd \n' \
+  $((block__age/31556926)) \
+  $((block__age%31556926/2629743)) \
+  $((block__age%2629743/86400)) \
+)
+
+# mempool count
+mem_pool_raw=$(jq -r '.size' <<<"$mempoolinfo_json")
+mem_pool=$(fmt_int "$mem_pool_raw")
+
+# ---- Output ----
+output=$(
+version=$(bitcoind -version)
+version=${version%%$'\n'*}        # first line only
+version=${version/ daemon version/}
+echo -e "${bold}${version}  $(date -I)${off}"
+  echo
+
+  echo "1 BTC = \$${BTC1}"
+  echo -e "\e[32mWallet\e[0m"
+  if [[ $wallet -eq 1 ]]; then
+    echo -e "\e[5m\e[42mBTC:\e[0m $BTC0 +$BTC_diff"
+    mpg123 -q "$HOME/.bitcoin/cash.mp3" || true
+  else
+    echo "BTC: $BTC0"
+  fi
+
+  echo "USD: \$${BTC_US}"
+  echo -e "${green}Recommended Miner Fees${off}"
+  echo "Satoshis/vByte: $feerate  (AltFee: $altfeerate_sats)"
+  echo "BTC(USD)/tx: ${miner_fee_BTC}(\$${miner_fee_US})"
+  echo
+
+  echo -e "\e[32mBlockchain\e[0m"
+  echo "Block: $block0_fmt  Age: $block0_age minutes"
+  echo "Block: $block1_fmt  Age: $block1_age minutes"
+  echo "Block: $block2_fmt  Age: $block2_age minutes"
+  echo "Block: 0        Age: $genesis_block2"
+  echo "Mempool: $mem_pool"
+  echo
+
+  echo -e "\e[32mNetwork\e[0m"
+  echo "GBs recv: $bytes_rcv"
+  echo "GBs sent: $bytes_snt"
+  echo "Inbound Connections: $inbound"
+  echo "Outbound Connections: $outbound"
+  echo
+
+  echo -e "\e[32mServer UpTime\e[0m"
+  printf '%dmo:%dd:%dh:%dm:%ds  \n' \
+    $((seconds/2629743)) \
+    $((seconds%2629743/86400)) \
+    $((seconds%86400/3600)) \
+    $((seconds%3600/60)) \
+    $((seconds%60))
+  echo
+
+  echo -e "\e[32mStorage\e[0m"
+  df -h / /mnt/files.ntfs --output='target','size','used','avail','pcent'
+)
+
+echo "$output"
+
+# persist BTC0 for next comparison
+echo "BTC0=$BTC0" > "$BTC_VALUE_FILE"
+
+# write node_down_log
+{
+  date
+  echo "Block:  $block0_fmt   Age:  $block0_age  minutes"
+  echo "Mempool: $mem_pool"
+  echo
+  echo "Total Connections:  $peers"
+  printf 'Server UpTime: %dd:%dh:%dm:%ds  \n' \
+    $((seconds/86400)) \
+    $((seconds%86400/3600)) \
+    $((seconds%3600/60)) \
+    $((seconds%60))
+  echo
+  free -m
+} > "$NODE_DOWN_LOG"
+

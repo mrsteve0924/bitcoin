@@ -1,20 +1,27 @@
 #!/bin/bash
-
 # list used and new bitcoin addresses
+
+bitcoin_cli() {
+    command bitcoin-cli -datadir=/mnt/files.ntfs/Crypto/Bitcoin/ -conf=bitcoin-pruned.conf "$@"
+}
+
 echo
 echo "Current Wallet Addresses"
-bitcoin-cli getaddressesbylabel "" | grep ": {" | cut -d \" -f2 | cut -d { -f2
+bitcoin_cli getaddressesbylabel "" | jq -r 'keys[]'
 
 echo
 echo "Used Receiving Addresses"
-bitcoin-cli listreceivedbyaddress | grep address | cut -d : -f2 | cut -d \" -f2
+bitcoin_cli listreceivedbyaddress | jq -r '.[].address'
 
 echo
 
-bitcoin-cli getaddressesbylabel "" | grep ": {" | cut -d \" -f2 | cut -d { -f2 > /tmp/addresses1
-bitcoin-cli listreceivedbyaddress | grep address | cut -d : -f2 | cut -d \" -f2 > /tmp/addresses2
+bitcoin_cli getaddressesbylabel "" | jq -r 'keys[]' \
+    > /tmp/addresses1
+
+bitcoin_cli listreceivedbyaddress | jq -r '.[].address' \
+    > /tmp/addresses2
 
 echo "Never Used Addresses"
-diff /tmp/addresses1 /tmp/addresses2 | grep \< | cut -d \< -f2 | sed 's/^[ \t]*//;s/[ \t]*$//'
+comm -23 <(sort /tmp/addresses1) <(sort /tmp/addresses2)
 
 echo
